@@ -58,12 +58,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // 保存下載進度
-async function saveProgress(novelId, title, downloadedChapters, content) {
+async function saveProgress(novelId, title, downloadedChapters, downloadedContents) {
   await chrome.storage.local.set({
     [`novel_${novelId}`]: {
       title,
       downloadedChapters,
-      content,
+      downloadedContents, // 改為保存各章節的內容，而不是整個合併後的內容
       lastUpdate: Date.now()
     }
   });
@@ -124,8 +124,8 @@ async function startNovelDownload() {
     
     // 檢查是否有保存的進度
     let savedProgress = await getProgress(novelId);
-    let content = savedProgress?.content || `${title}\n\n`;
     let downloadedChapters = savedProgress?.downloadedChapters || [];
+    let downloadedContents = savedProgress?.downloadedContents || [];
     
     // 更新進度顯示
     const updateProgress = (current, total) => {
@@ -156,19 +156,22 @@ async function startNovelDownload() {
       
       try {
         const chapterContent = await getChapterContent(chapter.url);
-        content += `\n\n${chapter.title}\n\n${chapterContent}`;
+        downloadedContents.push(`\n\n${chapter.title}\n\n${chapterContent}`);
         downloadedChapters.push(chapter.url);
         
         // 每下載一章就保存進度
-        await saveProgress(novelId, title, downloadedChapters, content);
+        await saveProgress(novelId, title, downloadedChapters, downloadedContents);
       } catch (error) {
         console.error(`下載章節失敗: ${chapter.title}`, error);
         // 保存當前進度，下次可以從這裡繼續
-        await saveProgress(novelId, title, downloadedChapters, content);
+        await saveProgress(novelId, title, downloadedChapters, downloadedContents);
         throw error;
       }
     }
 
+    // 合併所有章節內容
+    const content = `${title}\n\n` + downloadedContents.join('');
+    
     console.log('所有章節下載完成，總字數:', content.length);
     
     // 在本地觸發下載
@@ -201,14 +204,17 @@ async function saveCurrentProgress() {
     const novelId = getNovelId();
     const savedProgress = await getProgress(novelId);
     
-    if (!savedProgress || !savedProgress.content) {
+    if (!savedProgress || !savedProgress.downloadedContents || savedProgress.downloadedContents.length === 0) {
       throw new Error('沒有可以儲存的進度');
     }
     
-    console.log('正在儲存當前進度，內容長度:', savedProgress.content.length);
+    // 合併已下載的章節內容
+    const content = `${savedProgress.title}\n\n` + savedProgress.downloadedContents.join('');
+    
+    console.log('正在儲存當前進度，已下載章節數:', savedProgress.downloadedChapters.length);
 
     // 在本地觸發下載
-    const success = triggerDownload(savedProgress.content, `${savedProgress.title}_部分.txt`);
+    const success = triggerDownload(content, `${savedProgress.title}_部分.txt`);
     
     if (success) {
       // 發送完成訊息
