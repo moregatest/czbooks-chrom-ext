@@ -48,10 +48,18 @@ async function getChapterContent(url) {
   }
 }
 
+// 從 Chrome Storage 讀取設定
+async function getSettings() {
+  const result = await chrome.storage.local.get('czbooks_settings');
+  return result.czbooks_settings || { batchSize: 100 };
+}
+
 // 監聽來自 popup 的消息
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'startDownload') {
-    startNovelDownload();
+    // 傳遞批次大小設定
+    console.log('收到開始下載消息，批次大小設定為:', message.batchSize);
+    startNovelDownload(parseInt(message.batchSize, 10));
   } else if (message.action === 'saveProgress') {
     saveCurrentProgress();
   }
@@ -63,7 +71,8 @@ async function saveProgress(novelId, title, downloadedChapters, downloadedConten
     [`novel_${novelId}`]: {
       title,
       downloadedChapters,
-      downloadedContents, // 改為保存各章節的內容，而不是整個合併後的內容
+      // 只保存最後 50 章的內容，避免超出儲存空間配額
+      downloadedContents: downloadedContents.slice(-50),
       lastUpdate: Date.now()
     }
   });
@@ -112,7 +121,7 @@ function triggerDownload(content, filename) {
 }
 
 // 開始下載小說
-async function startNovelDownload() {
+async function startNovelDownload(customBatchSize) {
   try {
     if (hasCloudflareChallenge()) {
       throw new Error('請先通過 Cloudflare 驗證');
@@ -126,6 +135,43 @@ async function startNovelDownload() {
     let savedProgress = await getProgress(novelId);
     let downloadedChapters = savedProgress?.downloadedChapters || [];
     let downloadedContents = savedProgress?.downloadedContents || [];
+    let allDownloadedContents = []; // 用於存儲所有已下載的內容
+    
+    // 如果有已下載的內容，先保存到 allDownloadedContents
+    if (savedProgress && savedProgress.downloadedContents) {
+      allDownloadedContents = [...savedProgress.downloadedContents];
+    }
+    
+    // 取得批次大小設定
+    let BATCH_SIZE = 100; // 預設值
+    
+    // 輸出自訂批次大小參數
+    console.log('自訂批次大小參數:', customBatchSize, '類型:', typeof customBatchSize);
+    
+    // 如果有自訂的批次大小，則使用它
+    if (customBatchSize && !isNaN(customBatchSize)) {
+      const batchSize = parseInt(customBatchSize, 10);
+      if (batchSize >= 10 && batchSize <= 500) {
+        BATCH_SIZE = batchSize;
+        console.log('使用自訂批次大小:', BATCH_SIZE);
+      }
+    } else {
+      // 否則嘗試從儲存的設定中讀取
+      try {
+        const settings = await getSettings();
+        if (settings && settings.batchSize) {
+          BATCH_SIZE = parseInt(settings.batchSize, 10);
+          console.log('使用儲存的批次大小設定:', BATCH_SIZE);
+        }
+      } catch (error) {
+        console.log('無法讀取設定，使用預設值:', error);
+      }
+    }
+    
+    console.log(`批次大小設定為: ${BATCH_SIZE} 章`);
+    
+    let currentBatchCount = 0;
+    let currentBatchNumber = Math.floor(downloadedChapters.length / BATCH_SIZE) + 1;
     
     // 更新進度顯示
     const updateProgress = (current, total) => {
@@ -137,6 +183,46 @@ async function startNovelDownload() {
         total: total,
         novelId: novelId
       });
+    };
+    
+    // 觸發部分下載
+    const triggerPartialDownload = async () => {
+      const partialContent = allDownloadedContents.join('');
+      const partialFileName = `${title}_部分${currentBatchNumber}.txt`;
+      
+      console.log(`觸發部分下載: ${partialFileName}，內容長度: ${partialContent.length}`);
+      
+      const success = triggerDownload(partialContent, partialFileName);
+      
+      if (success) {
+        // 發送部分完成訊息
+        chrome.runtime.sendMessage({
+          type: 'partial_complete',
+          batchNumber: currentBatchNumber,
+          novelId: novelId
+        });
+        
+        // 清空已下載的內容，釋放記憶體
+        allDownloadedContents = [];
+        downloadedContents = [];
+        currentBatchNumber++;
+        currentBatchCount = 0;
+        
+        // 只保留章節 URL 列表，不保留內容
+        await chrome.storage.local.set({
+          [`novel_${novelId}`]: {
+            title,
+            downloadedChapters,
+            downloadedContents: [],
+            lastUpdate: Date.now()
+          }
+        });
+        
+        return true;
+      } else {
+        console.error('部分下載觸發失敗');
+        return false;
+      }
     };
 
     // 從上次的進度繼續下載
@@ -156,11 +242,20 @@ async function startNovelDownload() {
       
       try {
         const chapterContent = await getChapterContent(chapter.url);
-        downloadedContents.push(`\n\n${chapter.title}\n\n${chapterContent}`);
+        const formattedContent = `\n\n${chapter.title}\n\n${chapterContent}`;
+        
+        downloadedContents.push(formattedContent);
+        allDownloadedContents.push(formattedContent);
         downloadedChapters.push(chapter.url);
+        currentBatchCount++;
         
         // 每下載一章就保存進度
         await saveProgress(novelId, title, downloadedChapters, downloadedContents);
+        
+        // 每下載 BATCH_SIZE 章就觸發一次部分下載
+        if (currentBatchCount >= BATCH_SIZE) {
+          await triggerPartialDownload();
+        }
       } catch (error) {
         console.error(`下載章節失敗: ${chapter.title}`, error);
         // 保存當前進度，下次可以從這裡繼續
@@ -169,25 +264,32 @@ async function startNovelDownload() {
       }
     }
 
-    // 合併所有章節內容
-    const content = `${title}\n\n` + downloadedContents.join('');
-    
-    console.log('所有章節下載完成，總字數:', content.length);
-    
-    // 在本地觸發下載
-    const success = triggerDownload(content, `${title}.txt`);
-    
-    if (success) {
-      // 下載完成後清除進度
-      await chrome.storage.local.remove(`novel_${novelId}`);
+    // 下載剩餘的章節
+    if (allDownloadedContents.length > 0) {
+      const finalContent = `${title}\n\n` + allDownloadedContents.join('');
+      console.log('最後部分下載完成，總字數:', finalContent.length);
       
+      // 在本地觸發下載
+      const success = triggerDownload(finalContent, `${title}_最終部分.txt`);
+      
+      if (success) {
+        // 下載完成後清除進度
+        await chrome.storage.local.remove(`novel_${novelId}`);
+        
+        // 發送完成訊息
+        chrome.runtime.sendMessage({
+          type: 'complete',
+          novelId: novelId
+        });
+      } else {
+        throw new Error('最終下載觸發失敗');
+      }
+    } else {
       // 發送完成訊息
       chrome.runtime.sendMessage({
         type: 'complete',
         novelId: novelId
       });
-    } else {
-      throw new Error('下載觸發失敗');
     }
 
   } catch (error) {

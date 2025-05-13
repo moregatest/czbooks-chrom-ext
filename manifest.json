@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CZBooks 小說下載器",
-  "version": "1.1",
+  "version": "1.2",
   "description": "自動下載 czbooks.net 小說內容",
   "permissions": [
     "activeTab",
